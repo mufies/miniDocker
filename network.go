@@ -9,19 +9,22 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-func setupNetwork(pid int) error {
+func setupNetwork(pid int, containerName string) error {
+	vethHostName := "veth-" + containerName
+	vethNsName := "veth-ns-" + containerName
+
 	veth := &netlink.Veth{
-		LinkAttrs: netlink.LinkAttrs{Name: "veth-host"},
-		PeerName:  "veth-ns",
+		LinkAttrs: netlink.LinkAttrs{Name: vethHostName},
+		PeerName:  vethNsName,
 	}
 	err := netlink.LinkAdd(veth)
 	if err != nil {
 		return err
 	}
 
-	vethNs, err := netlink.LinkByName("veth-ns")
+	vethNs, err := netlink.LinkByName(vethNsName)
 	if err != nil {
-		return fmt.Errorf("Loi tim veth-ns: %w", err)
+		return fmt.Errorf("Loi tim %s: %w", vethNsName, err)
 	}
 
 	err = netlink.LinkSetNsPid(vethNs, pid)
@@ -29,11 +32,11 @@ func setupNetwork(pid int) error {
 		return fmt.Errorf("Loi dua veth-ns vao namespace: %w", err)
 	}
 
-	// gan ip cho host
-	vethHost, err := netlink.LinkByName("veth-host")
+	vethHost, err := netlink.LinkByName(vethHostName)
 	if err != nil {
 		return fmt.Errorf("lỗi gán IP veth-host: %w", err)
 	}
+
 	addr, err := netlink.ParseAddr("10.0.0.1/24")
 	if err != nil {
 		return fmt.Errorf("lỗi parse IP: %w", err)
@@ -58,13 +61,14 @@ func setupNetwork(pid int) error {
 	return nil
 }
 
-func setupContainerNetwork() error {
-	// Đợi 1 chút để đảm bảo namespace đã sẵn sàng (tránh race condition)
+func setupContainerNetwork(containerName string) error {
 	time.Sleep(100 * time.Millisecond)
 
-	link, err := netlink.LinkByName("veth-ns")
+	vethNsName := "veth-ns-" + containerName
+
+	link, err := netlink.LinkByName(vethNsName)
 	if err != nil {
-		return fmt.Errorf("lỗi tìm veth-ns: %w", err)
+		return fmt.Errorf("lỗi tìm %s: %w", vethNsName, err)
 	}
 
 	addr, _ := netlink.ParseAddr("10.0.0.2/24")
