@@ -1,57 +1,57 @@
 # miniDocker
 
-Container runtime viết từ đầu bằng Go, không dùng Docker hay runc — tự tay dựng lại các cơ chế kernel Linux mà container thật sự dùng: namespaces, chroot, cgroups, và network bằng veth pair.
+A container runtime built from scratch in Go — no Docker, no runc. It directly implements the Linux kernel mechanisms that real containers rely on: namespaces, chroot, cgroups, and networking via veth pairs.
 
-Dự án làm để hiểu "container hoạt động ra sao bên dưới" chứ không phải để thay thế Docker.
+This is a research/educational project exploring how container isolation actually works at the kernel level. It is not intended as a production-ready or Docker-replacement tool.
 
-## Tính năng
+## Features
 
-- **Namespace cô lập**: UTS (hostname), PID (cây process riêng), Mount (filesystem riêng), Network (card mạng riêng)
-- **Chroot** vào root filesystem riêng (Alpine Linux minirootfs)
-- **cgroup v2**: giới hạn RAM qua `memory.max`
-- **Network namespace thật**: veth pair + NAT (iptables MASQUERADE), container ra internet thật qua địa chỉ IP riêng
-- **CLI**: `run`, `ps`, `stop` với cờ `--name`, `--memory`
-- Lưu trạng thái container ra JSON, dọn dẹp (cgroup, veth, state) khi `stop`
+- **Namespace isolation**: UTS (hostname), PID (separate process tree), Mount (separate filesystem view), Network (separate network stack)
+- **Chroot** into an isolated root filesystem (Alpine Linux minirootfs)
+- **cgroup v2**: memory limiting via `memory.max`
+- **Real network namespace**: veth pair + NAT (iptables MASQUERADE), giving the container real internet access through its own IP
+- **CLI**: `run`, `ps`, `stop` with `--name` and `--memory` flags
+- Container state persisted to JSON; cleanup (cgroup, veth, state) handled on `stop`
 
-## Kiến trúc
+## Architecture
 
 ```
 minidocker run --name web1 --memory 100 /bin/sh
         │
         ▼
-   parent()  ── parse cờ --name/--memory
+   parent()  ── parses --name/--memory flags
         │
         ├─ exec.Command("/proc/self/exe", "child", name, cmd...)
-        │  với Cloneflags: CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET
+        │  with Cloneflags: CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET
         │
-        ├─ setupNetwork(pid, name)   — tạo veth pair, gán IP host, NAT
-        ├─ setupCgroup(pid, memMB)   — giới hạn RAM qua /sys/fs/cgroup
-        ├─ saveContainerInfo(...)    — ghi JSON state
+        ├─ setupNetwork(pid, name)   — creates veth pair, assigns host IP, sets up NAT
+        ├─ setupCgroup(pid, memMB)   — applies memory limit via /sys/fs/cgroup
+        ├─ saveContainerInfo(...)    — writes JSON state
         │
         ▼
-   child()  (chạy trong namespace mới, tự động là PID 1)
+   child()  (runs inside the new namespaces, automatically becomes PID 1)
         │
         ├─ Sethostname()
-        ├─ Chroot() + Chdir("/")     — đổi root filesystem
-        ├─ Mount("/proc")            — cho ps hoạt động đúng
-        ├─ setupContainerNetwork()   — gán IP, route bên trong container
+        ├─ Chroot() + Chdir("/")     — switches root filesystem
+        ├─ Mount("/proc")            — required for ps to work correctly
+        ├─ setupContainerNetwork()   — assigns IP/route inside the container
         │
-        └─ syscall.Exec(binary, args, env)  — thay thế chính mình bằng lệnh thật
+        └─ syscall.Exec(binary, args, env)  — replaces itself with the target process
 ```
 
-**Điểm kỹ thuật đáng chú ý:**
-- Dùng pattern `/proc/self/exe` để tự gọi lại chính mình làm process con — cách Go lách việc không có `fork()` an toàn trong chương trình multi-thread
-- `syscall.Exec` (không phải `cmd.Run()`) ở tầng child, để quá trình cuối cùng giữ đúng PID 1 trong namespace, thay vì trở thành PID 2
-- Network dùng thư viện `netlink` gọi thẳng kernel qua netlink socket, không shell ra lệnh `ip` — đúng cách runc/Docker thật làm
+**Notable implementation details:**
+- Uses the `/proc/self/exe` re-exec pattern to spawn a child process, working around Go's lack of a safe `fork()` in multi-threaded programs
+- Uses `syscall.Exec` (not `cmd.Run()`) in the child, so the final process correctly becomes PID 1 inside the namespace instead of PID 2
+- Networking is implemented via the `netlink` library, talking to the kernel directly over netlink sockets rather than shelling out to `ip` — the same approach runc/Docker use internally
 
-## Cách chạy
+## Usage
 
-Yêu cầu: Linux (hoặc WSL2), Go 1.21+, quyền root.
+Requirements: Linux (or WSL2), Go 1.21+, root privileges.
 
 ```bash
 go build -o minidocker .
 
-# Tải Alpine rootfs (1 lần)
+# Download the Alpine rootfs (one-time setup)
 mkdir -p ~/mydocker-rootfs && cd ~/mydocker-rootfs
 curl -O https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz
 tar -xzf alpine-minirootfs-*.tar.gz
@@ -60,15 +60,15 @@ cd -
 sudo ./minidocker run --name web1 --memory 100 /bin/sh
 ```
 
-Trong container:
+Inside the container:
 
 ```bash
-hostname          # minicontainer — hostname riêng
-echo $$           # 1 — PID namespace riêng
-ping 8.8.8.8      # ra internet qua veth + NAT
+hostname          # minicontainer — isolated hostname
+echo $$           # 1 — isolated PID namespace
+ping 8.8.8.8      # real internet access via veth + NAT
 ```
 
-Ở terminal khác:
+From another terminal:
 
 ```bash
 sudo ./minidocker ps
@@ -77,27 +77,27 @@ sudo ./minidocker stop web1
 
 ## Benchmark
 
-So sánh trên cùng máy (WSL2, Ubuntu), Docker đã cài sẵn và image đã pull trước:
+Measured on the same machine (WSL2, Ubuntu), with Docker pre-installed and the image pre-pulled:
 
-| Phép đo | minidocker | docker run |
+| Measurement | minidocker | docker run |
 |---|---|---|
-| Thời gian khởi động (`echo hello`) | 0.273s | 0.680s |
+| Startup time (`echo hello`) | 0.273s | 0.680s |
 
-`minidocker` khởi động nhanh hơn Docker thật khoảng 2.5 lần trong phép đo này — hợp lý vì Docker đi qua nhiều lớp daemon (`dockerd` → `containerd` → `containerd-shim` → `runc`), còn `minidocker` chỉ là 1 binary gọi thẳng syscall, không qua IPC/daemon nào.
+minidocker starts roughly 2.5x faster than real Docker in this measurement — expected, since Docker goes through several daemon layers (`dockerd` → `containerd` → `containerd-shim` → `runc`), while minidocker is a single binary making direct syscalls with no IPC/daemon overhead.
 
-*Lưu ý: đây là phép đo đơn giản trên 1 máy, không đại diện cho hiệu năng production. Docker có nhiều việc phải làm hơn (logging driver, network plugin, volume mount...) mà minidocker không có.*
+*Note: this is a simple single-machine measurement, not representative of production performance. Docker handles substantially more (logging drivers, network plugins, volume mounts, etc.) that minidocker does not.*
 
-## Hạn chế đã biết
+## Known Limitations
 
-So với Docker/runc thật, minidocker còn thiếu:
+Compared to real Docker/runc, minidocker currently lacks:
 
-- **Chỉ chạy 1 container tại 1 thời điểm** — IP trong container đang hardcode `10.0.0.2`, chạy 2 container cùng lúc sẽ đụng IP. Docker thật dùng IPAM (IP Address Management) để cấp phát động.
-- **Không có `/dev`** — chưa mount hay tạo device node (`/dev/zero`, `/dev/null`, `/dev/urandom`...), nên một số chương trình cần các file này sẽ lỗi.
-- **Không có image layer** — dùng thẳng 1 bản Alpine rootfs copy cứng, không có overlay filesystem, không cache layer, không `docker build`.
-- **Không có user namespace** (`CLONE_NEWUSER`) — container chạy với quyền root thật của host, không cô lập quyền.
-- **Không có DNS riêng** — container dùng chung resolver của host (qua file `/etc/resolv.conf` kế thừa, chưa tự quản lý).
-- **cgroup chỉ giới hạn RAM** — chưa có `--cpus`, `pids.max`, I/O limit.
+- **Single container at a time** — the in-container IP is hardcoded to `10.0.0.2`; running two containers simultaneously would collide. Real Docker uses dynamic IPAM (IP Address Management).
+- **No `/dev`** — device nodes (`/dev/zero`, `/dev/null`, `/dev/urandom`, etc.) are neither mounted nor created, so programs that depend on them will fail.
+- **No image layers** — uses a single hardcoded Alpine rootfs copy; no overlay filesystem, no layer caching, no `docker build` equivalent.
+- **No user namespace** (`CLONE_NEWUSER`) — the container runs with the host's real root privileges; no privilege isolation.
+- **No dedicated DNS** — the container inherits the host's resolver rather than managing its own.
+- **cgroup limits only memory** — no `--cpus`, `pids.max`, or I/O limits yet.
 
-## Những gì học được
+## Interesting finding
 
-Phát hiện thú vị nhất trong quá trình làm: máy có cài Docker thật sẽ tự đặt `iptables FORWARD` policy thành `DROP` để kiểm soát traffic container của chính nó — khiến traffic của `minidocker` (dùng dải IP khác) bị chặn hoàn toàn dù route/NAT đều đúng, cho tới khi thêm rule `ACCEPT` tường minh cho dải IP của minidocker. Đây là ví dụ thực tế về việc 2 container runtime khác nhau có thể xung đột ở tầng mạng khi chạy chung 1 kernel.
+The most notable discovery during development: a machine with real Docker installed sets the `iptables FORWARD` chain policy to `DROP` to control its own containers' traffic — which silently blocked minidocker's traffic (a different IP range) even though routing and NAT were both correctly configured, until an explicit `ACCEPT` rule was added for minidocker's subnet. A concrete example of how two independent container runtimes can conflict at the network layer when sharing a single kernel.
